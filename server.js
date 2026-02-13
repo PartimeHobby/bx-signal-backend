@@ -60,6 +60,78 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+function cleanText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function parseHowField(sig) {
+  const how = cleanText(sig?.access?.how);
+  if (!how) {
+    return { fallbackContact: '', fallbackNote: '' };
+  }
+  const parts = how.split('|').map((part) => part.trim()).filter(Boolean);
+  if (!parts.length) {
+    return { fallbackContact: '', fallbackNote: '' };
+  }
+  if (parts.length === 1) {
+    const single = parts[0];
+    if (single.toLowerCase() === 'user submission') {
+      return { fallbackContact: '', fallbackNote: '' };
+    }
+    return { fallbackContact: '', fallbackNote: single };
+  }
+  return {
+    fallbackContact: parts[0],
+    fallbackNote: parts.slice(1).join(' | ')
+  };
+}
+
+function describeSignal(sig) {
+  const title = cleanText(sig?.title) || 'Untitled signal';
+
+  const startDate = new Date(sig?.startTime || '');
+  const when = Number.isNaN(startDate.getTime())
+    ? 'Not provided'
+    : startDate.toLocaleString('en-US', {
+      dateStyle: 'medium',
+      timeStyle: 'short'
+    });
+
+  const placeText = cleanText(sig?.access?.place) || cleanText(sig?.location);
+  const lat = Number.parseFloat(sig?.lat);
+  const lon = Number.parseFloat(sig?.lon);
+  const hasCoords = Number.isFinite(lat) && Number.isFinite(lon);
+  const where = placeText || (hasCoords ? `${lat.toFixed(5)}, ${lon.toFixed(5)}` : 'Not provided');
+  const mapHref = hasCoords ? `https://www.google.com/maps?q=${encodeURIComponent(`${lat},${lon}`)}` : '';
+
+  const { fallbackContact, fallbackNote } = parseHowField(sig);
+  const contact = cleanText(sig?.contact) || fallbackContact || 'Not provided';
+  const notes = cleanText(sig?.note) || fallbackNote || 'Not provided';
+  const topic = cleanText(sig?.topic) || 'Not provided';
+
+  const submittedDate = new Date(sig?.submittedAt || '');
+  const submitted = Number.isNaN(submittedDate.getTime())
+    ? 'Unknown'
+    : submittedDate.toLocaleString('en-US', {
+      dateStyle: 'medium',
+      timeStyle: 'short'
+    });
+
+  return {
+    id: String(sig?.id || ''),
+    title,
+    when,
+    where,
+    contact,
+    notes,
+    topic,
+    submitted,
+    hasCoords,
+    mapHref,
+    rawJson: JSON.stringify(sig, null, 2)
+  };
+}
+
 function safeEqual(a, b) {
   const aBuf = Buffer.from(String(a));
   const bBuf = Buffer.from(String(b));
@@ -185,38 +257,255 @@ app.get('/admin', requireAdmin, (req, res) => {
   const pending = readJsonArray(PENDING_FILE);
   const approvedCount = readJsonArray(APPROVED_FILE).length;
 
-  let html = '<h1>Admin Approval Dashboard</h1>';
-  html += `<p>Pending: ${pending.length} | Approved: ${approvedCount}</p>`;
-  html += '<ul>';
-
+  let cards = '';
   pending.forEach((sig) => {
-    const safeId = String(sig.id || '');
-    const safeTitle = escapeHtml(sig.title || 'Untitled');
-    const safeStart = escapeHtml(sig.startTime || 'No time');
-    const encodedId = encodeURIComponent(safeId);
-    html += `<li><strong>${safeTitle}</strong> (${safeStart}) [${escapeHtml(safeId)}] <button onclick="approveById('${encodedId}')">Approve</button> <button onclick="rejectById('${encodedId}')">Reject</button></li>`;
+    const info = describeSignal(sig);
+    const encodedId = encodeURIComponent(info.id);
+    const mapLine = info.hasCoords
+      ? `<a href="${info.mapHref}" target="_blank" rel="noopener">Open map location</a>`
+      : '<span class="dim">No coordinates provided</span>';
+
+    cards += `
+      <article class="card">
+        <header class="card-head">
+          <h3>${escapeHtml(info.title)}</h3>
+          <code>${escapeHtml(info.id || 'missing-id')}</code>
+        </header>
+        <dl class="meta">
+          <div><dt>What</dt><dd>${escapeHtml(info.title)}</dd></div>
+          <div><dt>When</dt><dd>${escapeHtml(info.when)}</dd></div>
+          <div><dt>Where</dt><dd>${escapeHtml(info.where)}<br>${mapLine}</dd></div>
+          <div><dt>Who / Contact</dt><dd>${escapeHtml(info.contact)}</dd></div>
+          <div><dt>Notes</dt><dd>${escapeHtml(info.notes)}</dd></div>
+          <div><dt>Topic</dt><dd>${escapeHtml(info.topic)}</dd></div>
+          <div><dt>Submitted</dt><dd>${escapeHtml(info.submitted)}</dd></div>
+        </dl>
+        <details>
+          <summary>Show raw request data</summary>
+          <pre>${escapeHtml(info.rawJson)}</pre>
+        </details>
+        <div class="actions">
+          <button class="approve" onclick="approveById('${encodedId}')">Approve (shows on map)</button>
+          <button class="reject" onclick="rejectById('${encodedId}')">Reject (discard)</button>
+        </div>
+      </article>
+    `;
   });
 
-  html += '</ul>';
-  html += `
-    <script>
-      function approveById(encodedId) {
-        const id = decodeURIComponent(encodedId);
-        fetch('/admin/approve', {
+  if (!cards) {
+    cards = '<p class="empty">No pending submissions right now.</p>';
+  }
+
+  const html = `
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BX Signal Admin</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115;
+      --panel: #171a22;
+      --line: #2a3040;
+      --text: #eef3ff;
+      --muted: #a9b3ca;
+      --ok: #34d399;
+      --bad: #f87171;
+      --accent: #7dd3fc;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: radial-gradient(circle at top, #151b2a, var(--bg) 55%);
+      color: var(--text);
+      padding: 24px 18px 40px;
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+    }
+    h1 {
+      margin: 0 0 8px;
+      letter-spacing: 0.02em;
+    }
+    .lead {
+      margin: 0 0 16px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .stats {
+      display: inline-flex;
+      gap: 8px;
+      margin-bottom: 16px;
+      font-size: 14px;
+    }
+    .pill {
+      border: 1px solid var(--line);
+      background: rgba(125, 211, 252, 0.1);
+      padding: 6px 10px;
+      border-radius: 999px;
+    }
+    #msg {
+      margin: 0 0 14px;
+      min-height: 20px;
+      color: var(--muted);
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: linear-gradient(180deg, #1a1f2c, var(--panel));
+      padding: 14px;
+      margin: 0 0 12px;
+      box-shadow: 0 10px 26px rgba(0, 0, 0, 0.28);
+    }
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 0 0 12px;
+    }
+    .card-head h3 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.25;
+    }
+    code {
+      background: rgba(125, 211, 252, 0.12);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 12px;
+    }
+    .meta {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      margin: 0 0 10px;
+    }
+    .meta div {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: rgba(255, 255, 255, 0.02);
+    }
+    dt {
+      color: var(--muted);
+      font-size: 12px;
+      margin: 0 0 3px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    dd {
+      margin: 0;
+      line-height: 1.4;
+    }
+    a { color: var(--accent); }
+    .dim { color: var(--muted); }
+    details {
+      margin: 8px 0 10px;
+    }
+    summary {
+      cursor: pointer;
+      color: var(--muted);
+    }
+    pre {
+      margin: 8px 0 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: #121520;
+      color: #d7def5;
+      font-size: 12px;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 13px;
+      cursor: pointer;
+      color: white;
+      background: #2a3142;
+    }
+    button.approve {
+      background: color-mix(in srgb, var(--ok) 32%, #1f2430);
+      border-color: color-mix(in srgb, var(--ok) 45%, #2a3142);
+    }
+    button.reject {
+      background: color-mix(in srgb, var(--bad) 24%, #1f2430);
+      border-color: color-mix(in srgb, var(--bad) 40%, #2a3142);
+    }
+    button:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
+    }
+    .empty {
+      border: 1px dashed var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>BX Signal Approval Dashboard</h1>
+    <p class="lead">Each card below is one user request. Approve means it becomes visible on the public map. Reject means it is removed.</p>
+    <div class="stats">
+      <span class="pill">Pending: ${pending.length}</span>
+      <span class="pill">Approved: ${approvedCount}</span>
+    </div>
+    <p id="msg" role="status" aria-live="polite"></p>
+    ${cards}
+  </main>
+  <script>
+    const msgEl = document.getElementById('msg');
+    function setMsg(message, isError) {
+      if (!msgEl) return;
+      msgEl.textContent = message;
+      msgEl.style.color = isError ? '#fda4af' : '#a9b3ca';
+    }
+    async function sendAction(path, id, actionWord) {
+      try {
+        const response = await fetch(path, {
           method: 'POST',
-          body: JSON.stringify({ id }),
-          headers: { 'Content-Type': 'application/json' }
-        }).then(() => location.reload());
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id })
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(body.message || 'Request failed');
+        }
+        setMsg(actionWord + ' complete. Reloading...', false);
+        setTimeout(() => location.reload(), 300);
+      } catch (err) {
+        setMsg(actionWord + ' failed: ' + err.message, true);
       }
-      function rejectById(encodedId) {
-        const id = decodeURIComponent(encodedId);
-        fetch('/admin/reject', {
-          method: 'POST',
-          body: JSON.stringify({ id }),
-          headers: { 'Content-Type': 'application/json' }
-        }).then(() => location.reload());
-      }
-    </script>
+    }
+    function approveById(encodedId) {
+      const id = decodeURIComponent(encodedId);
+      if (!confirm('Approve this request and publish it to the map?')) return;
+      sendAction('/admin/approve', id, 'Approve');
+    }
+    function rejectById(encodedId) {
+      const id = decodeURIComponent(encodedId);
+      if (!confirm('Reject this request and remove it from pending?')) return;
+      sendAction('/admin/reject', id, 'Reject');
+    }
+  </script>
+</body>
+</html>
   `;
 
   res.send(html);
